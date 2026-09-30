@@ -10,10 +10,18 @@ class ErrorCategory(str, Enum):
     BUSINESS_REJECTION = "business_rejection"
     DEPENDENCY_FAILURE = "dependency_failure"
     INTERNAL_ERROR = "internal_error"
+    # 调用方侧问题：请求格式/参数不对、访问了不存在的位置。
+    # 明确与服务端内部异常区分，不混进 internal_error。
+    INVALID_REQUEST = "invalid_request"
+    NOT_FOUND = "not_found"
 
 
 class BusinessRejection(Exception):
     """业务规则拒绝（如参数不合法、状态不允许）。"""
+
+
+class InvalidRequest(Exception):
+    """调用方输入问题（如类型错误、格式不对），属于 4xx 调用方侧错误。"""
 
 
 class DependencyFailure(Exception):
@@ -51,6 +59,13 @@ def normalize_error(exc: Exception, request_id: str) -> ErrorBody:
             category=ErrorCategory.BUSINESS_REJECTION,
             code="BUSINESS_REJECTION",
             message=str(exc) or "request rejected by business rule",
+            request_id=request_id,
+        )
+    if isinstance(exc, InvalidRequest):
+        return ErrorBody(
+            category=ErrorCategory.INVALID_REQUEST,
+            code="INVALID_REQUEST",
+            message=str(exc) or "request is invalid",
             request_id=request_id,
         )
     if isinstance(exc, DependencyFailure):
