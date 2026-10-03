@@ -76,6 +76,48 @@ DEFAULT_CALLER_TOTAL = WindowSpec(capacity=10, window_seconds=60.0)  # 跨版本
 构造方式不变；应用主链路已升级为 `QuotaManager`，对外错误结构、
 `Retry-After` 头、`X-Caller-Id` / `X-Api-Version` 头语义保持不变。
 
+## 请求体参数校验（`POST /orders`）
+
+请求体必须是**合法的 JSON 对象**，并按 `app/order_schema.py::OrderRequest`
+做显式类型校验。`quantity`（数量）字段的类型/格式判定规则如下：| 请求体中的值 | 判定 | 结果 |
+|---|---|---|
+| JSON 整数（`2`、`-1`、`0`） | 类型合法 | 进入业务：正数下单 200；`0`/负数业务拒绝 422 |
+| 文字（`"abc"`、`"1.9"`、`"true"`、`"null"`） | 非合法整数 | **400** `client_error / INVALID_REQUEST` |
+| `null`、数组（`[1]`）、对象（`{"n":1}`） | 类型不对 | **400** `client_error / INVALID_REQUEST` |
+| 布尔（`true` / `false`） | 类型不对（**不**当作 `1`/`0`） | **400** `client_error / INVALID_REQUEST` |
+| 带非零小数的数字（`1.9`、`-0.5`） | 非整数（**不**截断为 `1`） | **400** `client_error / INVALID_REQUEST` |
+| 整数值浮点（`1.0`、`2.0`）或整数字符串（`"2"`） | 无歧义、可无损转整数 | 按对应整数处理（与查询参数入口一致） |
+| 字段缺失 | 缺省为 `0` | 业务拒绝 422（既有语义保持不变） |
+
+`item`（商品）字段必须是 JSON 字符串：传数字、布尔、`null`、数组、对象等
+非字符串值同样返回 400 `client_error / INVALID_REQUEST`（旧实现对数组/对象
+会落成 500）；字段缺失（缺省为空串）或传未知商品名仍按业务拒绝 422 处理。
+
+请求体本身的问题同样按**调用方侧错误**处理，返回 HTTP 400
+`client_error / INVALID_REQUEST`，并在 `error.details` 中给出参数位置与
+简短原因：
+
+- 请求体不是合法 JSON（如 `{bad`、被截断的 JSON）；
+- 顶层不是 JSON 对象（数组 `[...]`、`null`、纯数字、字符串、空体）。
+
+这些情形**不会落成 500/internal_error，也不会静默转换后下单成功**；
+响应不包含 `order` 字段，且业务库存不被扣减，调用方不会误以为下单成功。
+错误响应只返回参数位置与简短原因，不含堆栈、地址等内部上下文。
+
+### 与查询参数入口（`GET /orders/preview`）一致
+
+两个入口共用同一套整数规则（Pydantic `int` 校验，布尔值在请求体模型中
+被显式拦截，因为 JSON 布尔会被宽松整数规则当作 `0/1`，而查询字符串
+`"true"` 本就无法解析）。对同一个有问题的数量值，无论走哪个入口，
+**HTTP 状态码、`error.category`、`error.code` 与错误结构都相同**：
+
+- 文字 / 带小数字符串 / `"true"` / `"null"`：两个入口均为 400；
+- `0`、负整数：两个入口均为业务拒绝 422；
+- 合法正整数：两个入口均 200。
+
+与版本拒绝不同，参数非法的请求仍会先经过版本/配额前置判定（两个入口
+行为一致）：因此配额耗尽时优先返回 429；请求通过前置判定后才做参数校验。
+
 ## 失败诊断与请求关联标识
 
 - 调用方可通过请求头 `X-Request-Id` 提供关联标识；缺省/为空/含非法字符时
@@ -116,7 +158,7 @@ DEFAULT_CALLER_TOTAL = WindowSpec(capacity=10, window_seconds=60.0)  # 跨版本
 # 安装依赖
 uv sync
 
-# 运行全部测试（既有版本协商/限流/异常用例 + 组合配额/诊断新用例）
+# 运行全部测试（版本协商/限流/异常/诊断用例 + 请求体参数校验用例）
 uv run pytest -q
 
 # 启动服务
@@ -135,6 +177,16 @@ curl -i -X POST localhost:8000/orders -H 'X-Api-Version: v9' \
 # 触发客户端错误（非法 JSON，400 client_error）
 curl -i -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' -d '{bad-json'
+
+# 触发客户端错误（quantity 类型不对，均为 400 client_error，不会 500 也不会静默下单）
+for q in '"abc"' 'null' 'true' '1.9' '[1]'; do
+  curl -s -o /dev/null -w "$q -> %{http_code}\n" -X POST localhost:8000/orders \
+    -H 'Content-Type: application/json' \
+    -d "{\"item\": \"book\", \"quantity\": $q}"
+done
+# 对照：同样的问题走查询参数入口，结论一致（400 client_error）
+curl -s -o /dev/null -w 'query abc -> %{http_code}\n' \
+  "localhost:8000/orders/preview?item=book&quantity=abc"
 
 # 触发 404
 curl -i localhost:8000/no/such/place
@@ -160,3 +212,19 @@ curl -s -X POST localhost:8000/orders -H 'Content-Type: application/json' \
 - `tests/test_diagnostics.py`：各成功/失败路径响应头与响应体 request_id
   一致、服务端生成/校验 request_id、非法 JSON 与参数类型错误归类为
   client_error、404 可追踪、日志可按 request_id 串联。
+- `tests/test_order_body_validation.py`（本轮新增）：请求体 `quantity`
+  非法类型（文字、null、布尔、带非零小数、数组、对象）一律 400
+  client_error/INVALID_REQUEST 且不静默下单/不扣库存；整数值浮点与整数
+  字符串按整数处理；合法整数按业务区分 200/422；请求体非法 JSON 或
+  非对象（数组/null/数字/字符串/空体）为 400；同一参数问题在两个入口
+  状态码、分类、code、结构一致；400 响应头/响应体 request_id 一致且
+  日志可串联；正常下单、缺字段/0/负数 422、依赖失败 502、内部异常 500
+  等既有语义不回归；`item` 非字符串为 400、缺失/未知商品名仍为 422；
+  并包含 `OrderRequest` 模型级单测。
+
+查看逐业务、逐用例的执行情况：
+
+```bash
+uv run pytest -v                      # 列出每个参数化用例的通过情况
+uv run pytest tests/test_order_body_validation.py -v
+```

@@ -24,6 +24,7 @@ from app.errors import (
     ErrorBody,
     normalize_error,
 )
+from app.order_schema import OrderRequest
 from app.quota import QuotaDecision, QuotaManager
 from app.quota_config import build_default_quota_manager
 from app.request_context import (
@@ -270,8 +271,8 @@ async def on_unexpected(request: Request, exc: Exception) -> JSONResponse:
 
 
 @app.post("/orders")
-def place_order(payload: dict, ctx: GatewayContext = Depends(gateway_guard)):
-    result = order_service.place_order(payload.get("item", ""), int(payload.get("quantity", 0)))
+def place_order(payload: OrderRequest, ctx: GatewayContext = Depends(gateway_guard)):
+    result = order_service.place_order(payload.item, payload.quantity)
     return {"request_id": ctx.request_id, "version": ctx.version, "order": result}
 
 
