@@ -76,6 +76,30 @@ DEFAULT_CALLER_TOTAL = WindowSpec(capacity=10, window_seconds=60.0)  # 跨版本
 构造方式不变；应用主链路已升级为 `QuotaManager`，对外错误结构、
 `Retry-After` 头、`X-Caller-Id` / `X-Api-Version` 头语义保持不变。
 
+## 请求体参数校验（POST /orders）
+
+请求体模型定义在 `app/schemas.py::OrderPayload`，判定与分类规则：
+
+- **`quantity` 必须是 JSON 整数**（严格判定，不做任何隐式转换）：
+  字符串（含 `"3"` 这类数字字符串）、`null`、布尔（`true`/`false`）、
+  带小数的数（含 `1.0` 这类浮点写法）、数组、对象，一律拒绝。
+  不会出现把 `1.9` 截断成 `1`、把 `true` 当成 `1` 放行的情况，
+  也不会因 `int()` 转换异常落成 500 服务端内部错误。
+- **`item` 必须是字符串**；非字符串（如数字）同样按调用方错误拒绝。
+- **请求体本身**：不是合法 JSON、或合法但不是 JSON 对象（数组/字符串/
+  数字/null），同样按调用方错误拒绝。
+- 以上全部归为 **客户端错误**：HTTP 400，`category = client_error`，
+  `code = INVALID_REQUEST`，响应体只含参数位置与简短原因，不泄露
+  堆栈等内部细节；响应头与响应体的 `request_id` 一致，服务端日志用
+  同一 `request_id` 串联。
+- **与查询参数入口一致**：同一参数问题（如 `quantity=abc`）走
+  `POST /orders`（请求体）与 `GET /orders/preview`（查询参数）得到
+  相同的状态码、分类与错误结构——两个入口的校验失败都汇入同一个
+  `RequestValidationError` 归一化处理器。
+- **既有语义不变**：缺省 `quantity` 仍按 `0` 处理（业务拒绝 422）；
+  `quantity` 为合法整数但 `<= 0` 仍是业务拒绝（422）；库存依赖失败
+  （502）、未预期异常（500）、正常下单（200）均不受影响。
+
 ## 失败诊断与请求关联标识
 
 - 调用方可通过请求头 `X-Request-Id` 提供关联标识；缺省/为空/含非法字符时
@@ -136,6 +160,15 @@ curl -i -X POST localhost:8000/orders -H 'X-Api-Version: v9' \
 curl -i -X POST localhost:8000/orders \
   -H 'Content-Type: application/json' -d '{bad-json'
 
+# 触发客户端错误（quantity 类型不对：文字/null/布尔/小数，均 400 client_error）
+curl -i -X POST localhost:8000/orders \
+  -H 'Content-Type: application/json' -d '{"item": "book", "quantity": "abc"}'
+curl -i -X POST localhost:8000/orders \
+  -H 'Content-Type: application/json' -d '{"item": "book", "quantity": 1.9}'
+
+# 对比：同一参数问题走查询参数入口，分类与错误结构一致
+curl -i 'localhost:8000/orders/preview?item=book&quantity=abc'
+
 # 触发 404
 curl -i localhost:8000/no/such/place
 
@@ -160,3 +193,8 @@ curl -s -X POST localhost:8000/orders -H 'Content-Type: application/json' \
 - `tests/test_diagnostics.py`：各成功/失败路径响应头与响应体 request_id
   一致、服务端生成/校验 request_id、非法 JSON 与参数类型错误归类为
   client_error、404 可追踪、日志可按 request_id 串联。
+- `tests/test_order_body_validation.py`：下单请求体参数校验——非法
+  quantity（文字/数字字符串/null/布尔/小数/数组/对象）与非法 item 类型、
+  非法 JSON、非对象请求体均为 400 client_error；拒绝后不扣库存、不静默
+  下单；与查询参数入口分类结构一致；request_id 头体一致且不泄露内部
+  细节；合法下单、quantity<=0 业务拒绝、依赖失败、未预期异常不回归。

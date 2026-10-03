@@ -31,6 +31,7 @@ from app.request_context import (
     assign_request_id,
     get_request_id,
 )
+from app.schemas import OrderPayload
 from app.service import OrderService
 from app.versioning import (
     UnsupportedVersionError,
@@ -270,8 +271,13 @@ async def on_unexpected(request: Request, exc: Exception) -> JSONResponse:
 
 
 @app.post("/orders")
-def place_order(payload: dict, ctx: GatewayContext = Depends(gateway_guard)):
-    result = order_service.place_order(payload.get("item", ""), int(payload.get("quantity", 0)))
+def place_order(payload: OrderPayload, ctx: GatewayContext = Depends(gateway_guard)):
+    """下单入口：请求体由 OrderPayload 严格校验。
+
+    数量等参数类型/格式不合法时在进入业务前即按调用方错误（400）拒绝，
+    不做 int() 截断或真值转换，与查询参数入口的判定口径一致。
+    """
+    result = order_service.place_order(payload.item, payload.quantity)
     return {"request_id": ctx.request_id, "version": ctx.version, "order": result}
 
 
